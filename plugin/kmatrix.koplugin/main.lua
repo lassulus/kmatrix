@@ -45,6 +45,34 @@ local STATE_LABELS = {
     offline = _("Offline"),
 }
 
+-- Why the daemon says it is not syncing, shortened to fit a title bar. "Offline"
+-- on its own is indistinguishable from wifi being off, the reader being asleep,
+-- or the daemon being gone -- so a sync that fails for a fixable reason looks
+-- exactly like one that is merely idle. Every pattern here has been read out of
+-- this device's own log: DNS that stopped answering, wifi that went away under
+-- a sleeping reader, a homeserver that did not reply in time.
+local OFFLINE_REASONS = {
+    { "lookup address information", _("cannot find the server") },
+    { "Network unreachable", _("no network") },
+    { "Connection refused", _("server refused the connection") },
+    { "certificate", _("certificate rejected") },
+    { "timeout", _("server did not answer") },
+}
+
+--- A daemon error as a short phrase, or nil when there is nothing to say.
+local function offlineReason(err)
+    if type(err) ~= "string" or err == "" then return nil end
+    for i = 1, #OFFLINE_REASONS do
+        if err:find(OFFLINE_REASONS[i][1], 1, true) then
+            return OFFLINE_REASONS[i][2]
+        end
+    end
+    -- Unrecognised: the daemon's own words beat silence, but they must not push
+    -- the account name off the bar.
+    if #err > 40 then return err:sub(1, 39) .. "…" end
+    return err
+end
+
 local function shellQuote(str)
     return "'" .. (str:gsub("'", "'\\''")) .. "'"
 end
@@ -334,6 +362,9 @@ function KMatrix:refreshStatus(done)
             self.device_id = resp.device_id
             self.homeserver = resp.homeserver
             self.backup = resp.backup
+            -- Carried so that opening the app while sync is failing says why,
+            -- not just that it is not working.
+            self.error = str(resp.error)
             -- Rendered timestamps follow the device's clock, however wrong.
             clock_skew_ms = tonumber(resp.clock_skew_ms) or 0
         end
@@ -344,6 +375,10 @@ end
 
 function KMatrix:statusText()
     local label = STATE_LABELS[self.state or "offline"] or self.state
+    if self.state == "offline" then
+        local why = offlineReason(self.error)
+        if why then label = label .. ": " .. why end
+    end
     -- Terse on purpose: this is a title bar on e-ink.
     if self.backup == false and self.state ~= "logged_out" then
         label = label .. "  ·  " .. _("no key backup")
@@ -1133,6 +1168,10 @@ end
 function KMatrix:onDaemonEvent(event)
     if event.event == "state" then
         self.state = event.state
+        -- The daemon backs off to a minute between retries, so this arrives at
+        -- most once a minute: it goes in the title bar, never a popup. A reader
+        -- that is merely asleep must not wake to a stack of dialogs.
+        self.error = str(event.error)
         self:updateSubtitle()
         if event.error then
             logger.warn("kmatrix: daemon reported", event.state, event.error)

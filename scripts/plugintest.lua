@@ -467,6 +467,54 @@ check("and it says the directory cannot be seen, not that nothing is installed",
     gone:find("Cannot see /tmp/kmatrix", 1, true) ~= nil, gone)
 data_dir_visible = true
 
+--[[ A sync that is failing says why ]]--
+
+-- Sync stopped and the screen said only "Offline" -- which looks exactly like
+-- wifi being off, or a sleeping reader, or no daemon at all. The daemon knew
+-- better the whole time: it had put the reason in the state event, and the
+-- plugin logged it to a file nobody reads.
+--
+-- The first error below was captured off the wire from the daemon on a Kindle
+-- PW5 on 2026-08-29, with the device's resolv.conf emptied to reproduce what
+-- had happened to it:
+--
+--   {"error":"io: failed to lookup address information: Try again",
+--    "event":"state","state":"offline"}
+--
+-- The rest are copied from that device's log.
+
+km.user_id = "@me:example.org"
+km.backup = nil
+
+km:onDaemonEvent({ event = "state", state = "offline",
+    error = "io: failed to lookup address information: Try again" })
+local bar = km:statusText()
+check("a homeserver that will not resolve is named as such",
+    bar:find("cannot find the server", 1, true) ~= nil, bar)
+check("so the bar is not just the bare state",
+    bar ~= "@me:example.org  \u{00B7}  Offline", bar)
+
+km:onDaemonEvent({ event = "state", state = "offline",
+    error = "io: Network unreachable (os error 101)" })
+check("wifi that went away reads differently from DNS that stopped answering",
+    km:statusText():find("no network", 1, true) ~= nil, km:statusText())
+
+-- A stale reason on a working client is a lie, so recovery must clear it.
+km:onDaemonEvent({ event = "state", state = "syncing" })
+local recovered = km:statusText()
+check("syncing again drops the reason", recovered:find("network", 1, true) == nil, recovered)
+check("and says it is syncing", recovered:find("Syncing", 1, true) ~= nil, recovered)
+
+-- Something the table has never seen still beats silence.
+km:onDaemonEvent({ event = "state", state = "offline", error = "banana" })
+check("an unrecognised reason is passed through",
+    km:statusText():find("banana", 1, true) ~= nil, km:statusText())
+
+local shouting = string.rep("x", 80)
+km:onDaemonEvent({ event = "state", state = "offline", error = shouting })
+check("and a very long one is cut so the account stays on the bar",
+    #km:statusText() < #shouting, km:statusText())
+
 --[[ Verdict ]]--
 
 print(("%d/%d checks passed"):format(checked - fails, checked))
