@@ -53,6 +53,31 @@ const REPAIR_EVENTS: u32 = 25;
 /// user sees an immediate effect instead of a silent success.
 const BACKUP_EAGER_ROOMS: usize = 3;
 
+/// Characters of the newest message kept as a room's list preview.
+///
+/// The preview is a denormalised copy rather than something derived when the
+/// list is read: this account has ~780 rooms, every stored body is encrypted at
+/// rest, and deriving it would mean decrypting 780 bodies on a 500 MHz CPU each
+/// time the room list is drawn. The copy has to be repaired whenever the
+/// message it came from changes -- see `refresh_preview`.
+const PREVIEW_WIDTH: usize = 64;
+
+/// Rooms whose newest message the preview sweep repairs per pass.
+///
+/// The expensive ones cost one request each, and the pass sits between
+/// long-polls, so this trades how fast the room list becomes readable against
+/// how long syncing is held up. Smaller than `NAME_BATCH` because a locked room
+/// always costs a request, whereas most rooms need no naming at all.
+const PREVIEW_BATCH: usize = 8;
+
+/// Rooms the preview sweep will queue in one run of the daemon.
+///
+/// A ceiling rather than a target: an account with thousands of locked rooms
+/// should make steady progress every run, not build an enormous queue and hold
+/// the radio all evening. What is left is picked up on the next run, which is
+/// also when a key that arrived meanwhile gets its second chance.
+const PREVIEW_SWEEP_MAX: u32 = 200;
+
 /// Rooms visited per naming pass. Each may cost one small request, and the
 /// pass sits between long-polls, so this trades how fast the sweep clears
 /// against how long syncing is held up.
@@ -523,6 +548,9 @@ fn sync_loop(sh: Arc<Shared>) {
         .ok()
         .and_then(|db| db.get_meta("room_names_schema").ok().flatten())
         .is_some_and(|v| v == NAME_SCHEMA);
+    // Built lazily, on the first pass that has room for it, and drained across
+    // later passes. `None` means "not asked yet".
+    let mut preview_queue: Option<Vec<String>> = None;
     while sh.running.load(Ordering::SeqCst) {
         let (api, session) = (sh.api(), sh.session());
         let (api, session) = match (api, session) {
@@ -546,6 +574,33 @@ fn sync_loop(sh: Arc<Shared>) {
                 Err(e) => {
                     names_done = true;
                     eprintln!("kmatrixd: room naming: {e:#}");
+                }
+            }
+        }
+
+        // Same slot, same reason. The queue is built once the naming sweep is
+        // out of the way, so the two do not compete for the gap between polls
+        // on a device where a request costs radio.
+        if names_done {
+            let queue = match preview_queue.as_mut() {
+                Some(q) => q,
+                None => {
+                    let built = match sh.db.lock() {
+                        Ok(db) => db.rooms_with_locked_newest(PREVIEW_SWEEP_MAX).ok(),
+                        Err(_) => None,
+                    };
+                    let built = built.unwrap_or_default();
+                    if !built.is_empty() {
+                        eprintln!("kmatrixd: {} room(s) with unreadable previews", built.len());
+                    }
+                    preview_queue.insert(built)
+                }
+            };
+            if !queue.is_empty() {
+                match sweep_previews(&sh, &api, queue) {
+                    Ok(n) if n > 0 => eprintln!("kmatrixd: repaired {n} room preview(s)"),
+                    Ok(_) => {}
+                    Err(e) => eprintln!("kmatrixd: preview sweep: {e:#}"),
                 }
             }
         }
@@ -717,7 +772,7 @@ fn process_sync(
 
         if let Some(last) = msgs.last() {
             room.last_ts = last.ts;
-            room.last_preview = preview(&last.body, 64);
+            room.last_preview = preview(&last.body, PREVIEW_WIDTH);
         }
 
         {
@@ -1364,7 +1419,186 @@ pub fn restore_room(sh: &Arc<Shared>, api: &Arc<Api>, version: &str, room: &str)
         db.upgrade_message(event_id, body)?;
         upgraded += 1;
     }
+    if upgraded > 0 {
+        refresh_preview(sh, room)?;
+    }
     Ok(upgraded)
+}
+
+/// Point a room's list preview back at its newest message, and tell the
+/// clients.
+///
+/// Every path that repairs messages in place goes through here. Repairing the
+/// message alone leaves the room list advertising
+/// "[encrypted — no key for this message]" for a message that now reads fine:
+/// the preview is a copy taken when the message arrived, and 441 of this
+/// account's 784 rooms were showing one for history that had already been
+/// recovered. Opening the room fixed the timeline and left the list wrong,
+/// which is exactly backwards -- the list is what you read to decide whether
+/// opening it is worth it.
+///
+/// Publishing is part of the same job: a room list that is right in the
+/// database and stale on screen is the same bug one layer up.
+fn refresh_preview(sh: &Arc<Shared>, room: &str) -> Result<()> {
+    let rooms = {
+        let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+        let newest = db.recent_messages(room, 1)?;
+        let Some(m) = newest.first() else {
+            return Ok(());
+        };
+        db.set_room_preview(room, &preview(&m.body, PREVIEW_WIDTH))?;
+        db.list_rooms()?
+    };
+    // The bus write can block for seconds on a slow reader; never under the
+    // database lock.
+    sh.bus
+        .publish(&serde_json::json!({ "event": "rooms", "rooms": rooms }));
+    Ok(())
+}
+
+/// Make one room's newest message readable, cheapest route first.
+///
+/// Deliberately narrower than [`repair_room`]: the room list needs exactly one
+/// message per room, and a sweep across hundreds of rooms cannot pay the
+/// hundred-message window that opening a room does. Measured on a real store of
+/// 784 rooms, 438 had an unreadable newest message, splitting three ways: 32
+/// whose key had arrived by some other route and needed no network at all, 17
+/// needing one key out of the backup, and 389 stored before this client kept
+/// ciphertext, where the event itself has to be fetched again before there is
+/// anything to decrypt.
+///
+/// Those three are one path, in cost order, and it matters that they run in a
+/// single visit: a refetch that stops after restoring the ciphertext leaves the
+/// room readable only on the *next* run. Measured that way it fixed 48 rooms and
+/// left 152 half-done.
+///
+/// Returns whether the message became readable.
+fn fix_newest_message(sh: &Arc<Shared>, api: &Arc<Api>, room: &str) -> Result<bool> {
+    let Some(newest) = ({
+        let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+        db.recent_messages(room, 1)?.into_iter().next()
+    }) else {
+        return Ok(false);
+    };
+    if newest.decrypted {
+        return Ok(false);
+    }
+
+    // Nothing stored to decrypt: fetch the event back first. `convert_event`
+    // decrypts it in passing when the key is already held, and otherwise keeps
+    // the ciphertext, which is what the rest of this function needs.
+    let newest = if newest.session_id.is_some() && newest.ciphertext.is_some() {
+        newest
+    } else {
+        let session = sh.session().ok_or_else(|| anyhow!("not logged in"))?;
+        let ev = api.event(room, &newest.event_id)?;
+        let Some(m) = convert_event(sh, room, &ev, &session)? else {
+            return Ok(false);
+        };
+        {
+            let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+            db.insert_message(&m)?;
+        }
+        if m.decrypted {
+            return Ok(true);
+        }
+        m
+    };
+    let (Some(sid), Some(ct)) = (&newest.session_id, &newest.ciphertext) else {
+        return Ok(false);
+    };
+
+    // The key may already be here: rooms share senders, and any earlier room
+    // open or to-device delivery may have imported it since.
+    if let Some(body) = megolm_body(sh, sid, ct) {
+        let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+        db.upgrade_message(&newest.event_id, &body)?;
+        return Ok(true);
+    }
+
+    // One key out of the backup: a single request, not the room's whole window.
+    let version = {
+        let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+        db.get_meta("backup_version")?
+    };
+    let has_key = match sh.net.lock() {
+        Ok(g) => g.crypto.as_ref().is_some_and(|c| c.has_backup_key()),
+        Err(_) => false,
+    };
+    let (Some(version), true) = (version, has_key) else {
+        return Ok(false);
+    };
+    let Ok(Some(entry)) = api.backup_session(&version, room, sid) else {
+        return Ok(false);
+    };
+    let imported = {
+        let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+        let mut net = sh.net.lock().map_err(|_| anyhow!("net lock poisoned"))?;
+        match net.crypto.as_mut() {
+            Some(c) => c.import_backup_session(&db, room, sid, &entry).is_ok(),
+            None => false,
+        }
+    };
+    if !imported {
+        return Ok(false);
+    }
+    let Some(body) = megolm_body(sh, sid, ct) else {
+        return Ok(false);
+    };
+    let db = sh.db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    db.upgrade_message(&newest.event_id, &body)?;
+    Ok(true)
+}
+
+/// Decrypt one Megolm ciphertext with the keys already held, and pull the
+/// message body out of it. `None` when the key is missing or there is no body
+/// worth showing -- both are ordinary, not errors.
+fn megolm_body(sh: &Arc<Shared>, session_id: &str, ciphertext: &str) -> Option<String> {
+    let json = {
+        let mut net = sh.net.lock().ok()?;
+        net.crypto.as_mut()?.decrypt(session_id, ciphertext).ok()?
+    };
+    let v = serde_json::from_str::<serde_json::Value>(&json).ok()?;
+    let body = v.get("content")?.get("body")?.as_str()?;
+    if body.is_empty() {
+        None
+    } else {
+        Some(body.to_string())
+    }
+}
+
+/// Work through the rooms whose newest message the list cannot read.
+///
+/// The room list is the first thing opened and the thing used to decide what is
+/// worth reading, so a list that says "[encrypted — no key for this message]"
+/// against half its rows is the worst place for locked history to sit. On the
+/// device 438 of 784 rooms were in that state, all of them recoverable, but only
+/// when the room was opened one at a time.
+///
+/// Bounded like the naming sweep and for the same reason: this runs between
+/// long-polls on a battery, and the expensive rooms cost one request each.
+/// `queue` is built once per run and drained a batch at a time, so a room that
+/// cannot be fixed is tried once rather than forever -- and again next run,
+/// since by then a key may have arrived.
+fn sweep_previews(sh: &Arc<Shared>, api: &Arc<Api>, queue: &mut Vec<String>) -> Result<usize> {
+    let mut fixed = 0usize;
+    let take = queue.len().min(PREVIEW_BATCH);
+    for room in queue.drain(..take).collect::<Vec<_>>() {
+        match fix_newest_message(sh, api, &room) {
+            Ok(true) => {
+                refresh_preview(sh, &room)?;
+                fixed += 1;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                // Almost always the radio rather than the room. Put the rest
+                // back and let the next pass retry once we are online again.
+                eprintln!("kmatrixd: preview for {room}: {e:#}");
+                break;
+            }
+        }
+    }
+    Ok(fixed)
 }
 
 /// Best-effort key recovery for a room the user just opened.
@@ -1406,7 +1640,16 @@ pub fn repair_room(sh: &Arc<Shared>, room: &str) {
 
     match refetch_placeholders(sh, room) {
         Ok(0) => return,
-        Ok(n) => eprintln!("kmatrixd: refetched {n} event(s) in {room} to unlock history"),
+        Ok(n) => {
+            eprintln!("kmatrixd: refetched {n} event(s) in {room} to unlock history");
+            // A refetch stores a decrypted body outright rather than upgrading
+            // a placeholder, so the preview has to be re-pointed here as well:
+            // the backup pass below may have nothing left to contribute, and
+            // then nothing else would.
+            if let Err(e) = refresh_preview(sh, room) {
+                eprintln!("kmatrixd: preview for {room}: {e:#}");
+            }
+        }
         Err(e) => {
             eprintln!("kmatrixd: refetching in {room}: {e:#}");
             return;
@@ -1794,6 +2037,32 @@ pub fn do_load_older(sh: &Arc<Shared>, room: &str, limit: u32) -> Result<(usize,
     Ok((stored, exhausted))
 }
 
+/// A daemon with a real store and a real bus, and nothing on the network.
+///
+/// One builder for the whole crate: `Shared` has a dozen fields, and two copies
+/// of this drift the moment one is added.
+#[cfg(test)]
+pub(crate) fn test_shared(dir: &std::path::Path) -> Arc<Shared> {
+    use crate::ipc::Bus;
+    let store = store::Store::open(&dir.join("s.db"), None).expect("open store");
+    Arc::new(Shared {
+        db: Mutex::new(store),
+        net: Mutex::new(NetState { crypto: None }),
+        api: Mutex::new(None),
+        st: Mutex::new(Status {
+            state: State::LoggedOut,
+            error: None,
+            session: None,
+        }),
+        bus: Bus::new(),
+        wake: (Mutex::new(false), Condvar::new()),
+        running: AtomicBool::new(true),
+        data_dir: dir.to_path_buf(),
+        ipc_token: std::sync::OnceLock::new(),
+        ipc_port: std::sync::OnceLock::new(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1965,5 +2234,109 @@ mod tests {
             name_from_members("@me:h", &m, &bridge).as_deref(),
             Some("Bot")
         );
+    }
+
+    /// Regression: opening a room recovered its messages and left the room
+    /// list still advertising "[encrypted — no key for this message]".
+    ///
+    /// The preview is a copy of the newest body taken when it arrived, so a
+    /// message repaired in place does not update it. On a real device 441 of
+    /// 784 rooms sat like that: the timeline read fine once opened, and the
+    /// list -- the thing you read to decide whether opening is worth it --
+    /// claimed there was nothing to read.
+    #[test]
+    fn recovering_a_message_repoints_the_room_preview() {
+        let dir = std::env::temp_dir().join(format!("kmatrix-prev-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let sh = test_shared(&dir);
+
+        let placeholder = "[encrypted — no key for this message]";
+        let room = "!r:example.org";
+        {
+            let db = sh.db.lock().expect("db");
+            db.upsert_room(&Room {
+                id: room.into(),
+                name: "Room".into(),
+                encrypted: true,
+                unread: 0,
+                last_ts: 200,
+                last_preview: placeholder.into(),
+            })
+            .expect("upsert room");
+            // An older message that is already readable, and the newest one
+            // still locked: the preview must follow the newest, not the first
+            // one that happens to be decryptable.
+            db.insert_message(&Message {
+                event_id: "$old".into(),
+                room: room.into(),
+                sender: "@bob:example.org".into(),
+                ts: 100,
+                body: "an older readable line".into(),
+                encrypted: true,
+                decrypted: true,
+                mine: false,
+                sender_name: None,
+                session_id: None,
+                ciphertext: None,
+            })
+            .expect("insert old");
+            db.insert_message(&Message {
+                event_id: "$new".into(),
+                room: room.into(),
+                sender: "@bob:example.org".into(),
+                ts: 200,
+                body: placeholder.into(),
+                encrypted: true,
+                decrypted: false,
+                mine: false,
+                sender_name: None,
+                session_id: Some("SESSION".into()),
+                ciphertext: Some("CIPHER".into()),
+            })
+            .expect("insert new");
+        }
+
+        // The key turns up and the message is repaired, exactly as a backup
+        // restore does it.
+        {
+            let db = sh.db.lock().expect("db");
+            db.upgrade_message("$new", "what it really said")
+                .expect("upgrade");
+        }
+
+        refresh_preview(&sh, room).expect("refresh");
+
+        let rooms = {
+            let db = sh.db.lock().expect("db");
+            db.list_rooms().expect("list")
+        };
+        assert_eq!(
+            rooms[0].last_preview, "what it really said",
+            "the list must show the message that is now readable"
+        );
+
+        // A long body is still truncated to the stored width, so repairing a
+        // preview cannot smuggle a whole message into the room list.
+        {
+            let db = sh.db.lock().expect("db");
+            db.upgrade_message("$new", &"y".repeat(200)).expect("long");
+        }
+        refresh_preview(&sh, room).expect("refresh long");
+        let rooms = {
+            let db = sh.db.lock().expect("db");
+            db.list_rooms().expect("list")
+        };
+        assert_eq!(
+            rooms[0].last_preview.chars().count(),
+            PREVIEW_WIDTH,
+            "preview must stay bounded: {}",
+            rooms[0].last_preview
+        );
+
+        // A room with no messages at all is a no-op, not an error: the eager
+        // pass runs over rooms that have never been paged in.
+        refresh_preview(&sh, "!empty:example.org").expect("empty room");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

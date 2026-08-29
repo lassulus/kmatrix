@@ -426,10 +426,7 @@ fn dispatch(sh: &Arc<Shared>, id: u64, cmd: Request) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::State;
-    use crate::{NetState, Shared, Status};
-    use std::sync::atomic::AtomicBool;
-    use std::sync::Condvar;
+    use crate::Shared;
 
     /// A client that stops reading fills its socket buffer. The daemon must
     /// drop it, not block in `write_all` -- and it blocks holding the client
@@ -468,23 +465,7 @@ mod tests {
     }
 
     fn shared(dir: &std::path::Path) -> Arc<Shared> {
-        let store = crate::store::Store::open(&dir.join("s.db"), None).expect("open store");
-        Arc::new(Shared {
-            db: Mutex::new(store),
-            net: Mutex::new(NetState { crypto: None }),
-            api: Mutex::new(None),
-            st: Mutex::new(Status {
-                state: State::LoggedOut,
-                error: None,
-                session: None,
-            }),
-            bus: Bus::new(),
-            wake: (Mutex::new(false), Condvar::new()),
-            running: AtomicBool::new(true),
-            data_dir: dir.to_path_buf(),
-            ipc_token: std::sync::OnceLock::new(),
-            ipc_port: std::sync::OnceLock::new(),
-        })
+        crate::test_shared(dir)
     }
 
     /// Regression: the IPC token used to live in the `meta` table, which
