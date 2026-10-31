@@ -1,6 +1,6 @@
-# kmatrix
+# kmatrix-koreader
 
-A Matrix client that runs on the e-reader itself. It targets jailbroken devices
+A Matrix client that runs on KOreader. It works on jailbroken devices
 running KOReader: Kindle Paperwhite 5, reMarkable 2, and armv7 Kobo hardware.
 Everything — TLS, sync, end-to-end encryption, message storage — happens on the
 device; there is no companion server and no phone in the loop.
@@ -31,6 +31,13 @@ The split is not stylistic. KOReader's Lua environment cannot do this job:
 
 The daemon solves each of these once, in a language with the right libraries,
 and hands the plugin small already-decrypted records.
+
+## Install
+
+Download the lastest Tar or Zip file from the releases
+Extract it then place kmatrix in the root of the KOReader folder
+Then place the other extracted folder kmatrix.plugin into the plugins folder of KOReader
+Reload KOReader and then you are ready to start messaging
 
 ## Measured behaviour
 
