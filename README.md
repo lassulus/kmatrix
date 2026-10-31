@@ -36,3 +36,33 @@ For detailed technical specifications, architecture notes, and development instr
 5. Ensure `kmatrixd` has execution permissions (Use Kterm or ssh):
    ```bash
    chmod +x /mnt/us/koreader/kmatrix/kmatrixd
+
+## Gallery
+
+<details>
+<summary><b>Chat View</b></summary>
+
+![Chat View](gallary/v0.1.0-beta/chatview.jpg)
+
+</details>
+
+<details>
+<summary><b>Contact List</b></summary>
+
+![Contact List](gallary/v0.1.0-beta/contactlist.jpg)
+
+</details>
+
+<details>
+<summary><b>Menu Options</b></summary>
+
+![Menu Options](gallary/v0.1.0-beta/menuoptions.jpg)
+
+</details>
+
+<details>
+<summary><b>Message Send</b></summary>
+
+![Message Send](gallary/v0.1.0-beta/messagesend.jpg)
+
+</details>
