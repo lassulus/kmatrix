@@ -29,7 +29,7 @@ For detailed technical specifications, architecture notes, and development instr
      ```text
      /mnt/us/koreader/plugins/
      ```
-   - Place the `kmatrixd` binary into the `kmatrix/` folder:
+   - Place the `kmatrix/` folder into:
      ```text
      /mnt/us/koreader/
      ```
