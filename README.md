@@ -34,10 +34,10 @@ and hands the plugin small already-decrypted records.
 
 ## Install
 
-Download the lastest Tar or Zip file from the releases
-Extract it then place kmatrix in the root of the KOReader folder
-Then place the other extracted folder kmatrix.plugin into the plugins folder of KOReader
-Reload KOReader and then you are ready to start messaging
+1. Download the lastest Tar or Zip file from the releases
+2. Extract it then place kmatrix in the root of the KOReader folder
+3. Then place the other extracted folder kmatrix.plugin into the plugins folder of KOReader
+4. Reload KOReader and then you are ready to start messaging
 
 ## Measured behaviour
 
