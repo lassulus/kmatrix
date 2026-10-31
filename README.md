@@ -27,11 +27,11 @@ For detailed technical specifications, architecture notes, and development instr
 4. Copy the extracted items into place:
    - Place the `kmatrix.koplugin/` folder into:
      ```text
-     /mnt/us/koreader/plugins/kmatrix.koplugin/
+     /mnt/us/koreader/plugins/
      ```
    - Place the `kmatrixd` binary into the `kmatrix/` folder:
      ```text
-     /mnt/us/koreader/kmatrix/kmatrixd
+     /mnt/us/koreader/
      ```
 5. Ensure `kmatrixd` has execution permissions:
    ```bash
