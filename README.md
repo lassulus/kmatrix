@@ -33,6 +33,6 @@ For detailed technical specifications, architecture notes, and development instr
      ```text
      /mnt/us/koreader/
      ```
-5. Ensure `kmatrixd` has execution permissions:
+5. Ensure `kmatrixd` has execution permissions (Use Kterm or ssh):
    ```bash
    chmod +x /mnt/us/koreader/kmatrix/kmatrixd
