@@ -733,6 +733,17 @@ fn process_sync(
             }
         }
 
+        // Check for low-priority tags in room account_data or tags
+        if let Some(account_data) = &jr.account_data {
+            for ev in &account_data.events {
+                if ev.kind == "m.tag" {
+                    if let Some(tags) = ev.content.get("tags").and_then(|t| t.as_object()) {
+                        room.low_priority = tags.contains_key("m.lowpriority");
+                    }
+                }
+            }
+        }
+
         // Lazy loading sends the membership of anyone who speaks in the batch,
         // which is exactly whose name the timeline is about to need.
         let names: BTreeMap<String, Option<String>> = jr
@@ -2261,6 +2272,7 @@ mod tests {
                 unread: 0,
                 last_ts: 200,
                 last_preview: placeholder.into(),
+                low_priority: false,
             })
             .expect("upsert room");
             // An older message that is already readable, and the newest one
